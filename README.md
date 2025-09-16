@@ -1,6 +1,6 @@
 # worktree
 
-Simple helper for creating git worktrees under `~/.worktrees/<repo>/…` and launching dev agents.
+Simple helper for creating git worktrees under `<repo>/.worktree/…` and launching dev agents.
 
 ## Usage
 
@@ -19,9 +19,9 @@ Run commands from anywhere inside a git repository or one of its worktrees. With
 branch argument the tool creates a timestamped worktree and a matching branch named
 `wt-<timestamp>`.
 
-Each repo gets its worktrees under `~/.worktrees/<repo-name>/`. Existing worktrees are
-reused automatically; if the target directory exists on disk but is not a registered
-worktree the command aborts instead of clobbering it.
+Each repo gets its worktrees under `<repo>/.worktree/`. Existing worktrees are reused
+automatically; if the target directory exists on disk but is not a registered worktree the
+command aborts instead of clobbering it.
 
 ## Install
 

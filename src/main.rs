@@ -100,8 +100,6 @@ struct RepoInfo {
     root: PathBuf,
     /// Absolute path to the current worktree root
     current_worktree: PathBuf,
-    /// Repository name derived from the primary root directory
-    name: String,
 }
 
 impl RepoInfo {
@@ -126,16 +124,9 @@ impl RepoInfo {
         let current_worktree = fs::canonicalize(current_worktree_raw.trim())
             .context("failed to canonicalize current worktree root")?;
 
-        let name = root
-            .file_name()
-            .ok_or_else(|| anyhow!("repository root lacks a final component"))?
-            .to_string_lossy()
-            .to_string();
-
         Ok(Self {
             root,
             current_worktree,
-            name,
         })
     }
 }
@@ -163,15 +154,22 @@ fn handle_agent(repo: &RepoInfo, cwd: &Path, agent: Agent, branch: Option<&str>)
 
 fn handle_create(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result<()> {
     let target = prepare_worktree(repo, cwd, branch)?;
-    println!("worktree ready at {}", target.display());
+    println!("{}", target.display());
     Ok(())
 }
 
 fn prepare_worktree(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result<PathBuf> {
-    let home = env::var("HOME").context("HOME environment variable is not set")?;
-    let base = Path::new(&home).join(".worktrees").join(&repo.name);
+    let base = repo.root.join(".worktree");
+    let worktrees = git_worktrees(cwd)?;
 
-    let worktree_paths = git_worktree_paths(cwd)?;
+    if let Some(branch_name) = branch {
+        if let Some(existing) = worktrees
+            .iter()
+            .find(|wt| wt.branch.as_deref() == Some(branch_name))
+        {
+            return Ok(existing.path.clone());
+        }
+    }
 
     let (branch_name, folder_name) = match branch {
         Some(name) => (name.to_owned(), sanitize_for_path(name)),
@@ -183,11 +181,11 @@ fn prepare_worktree(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result
 
     let target_path = base.join(&folder_name);
 
-    if worktree_paths
+    if let Some(existing) = worktrees
         .iter()
-        .any(|existing| paths_equal(existing, &target_path))
+        .find(|wt| paths_equal(&wt.path, &target_path))
     {
-        return Ok(target_path);
+        return Ok(existing.path.clone());
     }
 
     if target_path.exists() {
@@ -226,7 +224,7 @@ fn prepare_worktree(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result
         )
     })?;
 
-    Ok(target_path)
+    Ok(fs::canonicalize(&target_path).unwrap_or(target_path))
 }
 
 fn list_worktrees(_repo: &RepoInfo, cwd: &Path) -> Result<()> {
@@ -236,7 +234,7 @@ fn list_worktrees(_repo: &RepoInfo, cwd: &Path) -> Result<()> {
 }
 
 fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
-    let worktree_paths = git_worktree_paths(cwd)?;
+    let worktrees = git_worktrees(cwd)?;
 
     let repo_root = repo
         .root
@@ -247,8 +245,9 @@ fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
         .canonicalize()
         .context("failed to canonicalize current worktree")?;
 
-    let mut targets: Vec<&PathBuf> = worktree_paths
+    let mut targets: Vec<&PathBuf> = worktrees
         .iter()
+        .map(|wt| &wt.path)
         .filter(|p| !paths_equal(p, &repo_root) && !paths_equal(p, &current))
         .collect();
 
@@ -290,17 +289,60 @@ fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn git_worktree_paths(cwd: &Path) -> Result<Vec<PathBuf>> {
+struct GitWorktree {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn git_worktrees(cwd: &Path) -> Result<Vec<GitWorktree>> {
     let output = run_git(cwd, ["worktree", "list", "--porcelain"])?;
-    let mut paths = Vec::new();
+    let mut worktrees = Vec::new();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+
     for line in output.lines() {
+        if line.is_empty() {
+            flush_git_worktree(&mut worktrees, &mut path, &mut branch);
+            continue;
+        }
+
         if let Some(raw) = line.strip_prefix("worktree ") {
-            let path = PathBuf::from(raw.trim());
-            let canonical = fs::canonicalize(&path).unwrap_or(path);
-            paths.push(canonical);
+            flush_git_worktree(&mut worktrees, &mut path, &mut branch);
+            path = Some(PathBuf::from(raw.trim()));
+            branch = None;
+        } else if let Some(raw) = line.strip_prefix("branch ") {
+            let value = raw.trim();
+            if value.eq_ignore_ascii_case("(detached HEAD)") {
+                branch = None;
+            } else {
+                let normalized = value
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(value)
+                    .to_string();
+                branch = Some(normalized);
+            }
         }
     }
-    Ok(paths)
+
+    flush_git_worktree(&mut worktrees, &mut path, &mut branch);
+
+    Ok(worktrees)
+}
+
+fn flush_git_worktree(
+    collection: &mut Vec<GitWorktree>,
+    path: &mut Option<PathBuf>,
+    branch: &mut Option<String>,
+) {
+    if let Some(p) = path.take() {
+        let canonical = fs::canonicalize(&p).unwrap_or(p);
+        collection.push(GitWorktree {
+            path: canonical,
+            branch: branch.take(),
+        });
+    } else {
+        *branch = None;
+    }
 }
 
 fn git_branch_exists(cwd: &Path, branch: &str) -> Result<bool> {
