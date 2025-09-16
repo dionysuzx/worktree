@@ -129,6 +129,10 @@ impl RepoInfo {
             current_worktree,
         })
     }
+
+    fn worktree_dir(&self) -> PathBuf {
+        self.root.join("worktree")
+    }
 }
 
 fn handle_agent(repo: &RepoInfo, cwd: &Path, agent: Agent, branch: Option<&str>) -> Result<()> {
@@ -159,7 +163,7 @@ fn handle_create(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result<()
 }
 
 fn prepare_worktree(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result<PathBuf> {
-    let base = repo.root.join(".worktree");
+    let base = repo.worktree_dir();
     let worktrees = git_worktrees(cwd)?;
 
     if let Some(branch_name) = branch {
@@ -236,6 +240,8 @@ fn list_worktrees(_repo: &RepoInfo, cwd: &Path) -> Result<()> {
 fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
     let worktrees = git_worktrees(cwd)?;
 
+    let base = repo.worktree_dir();
+
     let repo_root = repo
         .root
         .canonicalize()
@@ -245,19 +251,42 @@ fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
         .canonicalize()
         .context("failed to canonicalize current worktree")?;
 
-    let mut targets: Vec<&PathBuf> = worktrees
+    let mut targets: Vec<PathBuf> = worktrees
         .iter()
-        .map(|wt| &wt.path)
+        .map(|wt| wt.path.clone())
         .filter(|p| !paths_equal(p, &repo_root) && !paths_equal(p, &current))
         .collect();
 
-    if targets.is_empty() {
+    let mut disk_entries = Vec::new();
+    if base.exists() {
+        for entry in
+            fs::read_dir(&base).with_context(|| format!("failed to list {}", base.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("failed to read entry under {}", base.display()))?;
+            let path = entry.path();
+            if paths_equal(&path, &repo_root) || paths_equal(&path, &current) {
+                continue;
+            }
+            disk_entries.push(path);
+        }
+    }
+
+    if targets.is_empty() && disk_entries.is_empty() {
         println!("no additional worktrees to clear");
         return Ok(());
     }
 
     if !yes {
-        print!("remove {} worktree(s)? [y/N]: ", targets.len());
+        if disk_entries.is_empty() {
+            print!("remove {} worktree(s)? [y/N]: ", targets.len());
+        } else {
+            print!(
+                "remove {} worktree(s) and {} directory(s)? [y/N]: ",
+                targets.len(),
+                disk_entries.len()
+            );
+        }
         io::stdout().flush().ok();
 
         let mut buffer = String::new();
@@ -271,6 +300,7 @@ fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
 
     // Ensure deterministic order for output
     targets.sort_unstable_by(|a, b| a.display().to_string().cmp(&b.display().to_string()));
+    disk_entries.sort_unstable_by(|a, b| a.display().to_string().cmp(&b.display().to_string()));
 
     for path in targets {
         println!("removing {}", path.display());
@@ -284,6 +314,28 @@ fn clear_worktrees(repo: &RepoInfo, cwd: &Path, yes: bool) -> Result<()> {
                     .ok_or_else(|| anyhow!("worktree path contains invalid UTF-8"))?,
             ],
         )?;
+    }
+
+    for path in disk_entries {
+        if path.is_dir() {
+            if let Err(err) = fs::remove_dir_all(&path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err)
+                        .with_context(|| format!("failed to remove directory {}", path.display()));
+                }
+            }
+        } else if let Err(err) = fs::remove_file(&path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                return Err(err)
+                    .with_context(|| format!("failed to remove file {}", path.display()));
+            }
+        }
+    }
+
+    if let Err(err) = fs::remove_dir(&base) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err).with_context(|| format!("failed to remove {}", base.display()));
+        }
     }
 
     Ok(())
