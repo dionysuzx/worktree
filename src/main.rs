@@ -12,25 +12,40 @@ fn main() -> Result<()> {
     let cwd = env::current_dir().context("failed to resolve current directory")?;
     let repo = RepoInfo::discover(&cwd)?;
 
+    if cli.branch.is_some() && cli.command.is_some() {
+        bail!("branch argument cannot be used together with a subcommand");
+    }
+
     match cli.command {
-        CommandKind::Codex { branch } => {
+        Some(CommandKind::Codex { branch }) => {
             handle_agent(&repo, &cwd, Agent::Codex, branch.as_deref())?
         }
-        CommandKind::Claude { branch } => {
+        Some(CommandKind::Claude { branch }) => {
             handle_agent(&repo, &cwd, Agent::Claude, branch.as_deref())?
         }
-        CommandKind::List => list_worktrees(&repo, &cwd)?,
-        CommandKind::Clear { yes } => clear_worktrees(&repo, &cwd, yes)?,
+        Some(CommandKind::List) => list_worktrees(&repo, &cwd)?,
+        Some(CommandKind::Clear { yes }) => clear_worktrees(&repo, &cwd, yes)?,
+        None => handle_create(&repo, &cwd, cli.branch.as_deref())?,
     }
 
     Ok(())
 }
 
 #[derive(Parser)]
-#[command(name = "worktree", version, about = "Quick git worktree helper")]
+#[command(
+    name = "worktree",
+    version,
+    about = "Quick git worktree helper",
+    args_conflicts_with_subcommands = true,
+    long_about = None
+)]
 struct Cli {
+    /// Optional branch name when creating a plain worktree
+    #[arg(value_name = "BRANCH")]
+    branch: Option<String>,
+
     #[command(subcommand)]
-    command: CommandKind,
+    command: Option<CommandKind>,
 }
 
 #[derive(Subcommand)]
@@ -38,14 +53,16 @@ enum CommandKind {
     /// Create (or reuse) a worktree and start Codex inside it
     Codex {
         /// Optional branch name to use for the worktree
+        #[arg(value_name = "BRANCH")]
         branch: Option<String>,
     },
     /// Create (or reuse) a worktree and start Claude inside it
     Claude {
         /// Optional branch name to use for the worktree
+        #[arg(value_name = "BRANCH")]
         branch: Option<String>,
     },
-    /// List worktrees for the current repository
+    /// List git worktrees for the current repository
     #[command(alias = "ls")]
     List,
     /// Remove all additional worktrees for the current repository
@@ -141,6 +158,12 @@ fn handle_agent(repo: &RepoInfo, cwd: &Path, agent: Agent, branch: Option<&str>)
         bail!("{} exited with status {}", agent.command(), status);
     }
 
+    Ok(())
+}
+
+fn handle_create(repo: &RepoInfo, cwd: &Path, branch: Option<&str>) -> Result<()> {
+    let target = prepare_worktree(repo, cwd, branch)?;
+    println!("worktree ready at {}", target.display());
     Ok(())
 }
 
