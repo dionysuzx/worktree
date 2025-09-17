@@ -1,539 +1,313 @@
+use anyhow::{Context, Result, bail};
+use clap::{Args, Parser, Subcommand};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
-
-const MANIFEST: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
+use toml::Value;
 
 #[derive(Parser)]
-#[command(
-    name = "worktree",
-    version,
-    about = "Manage git worktrees with helpers"
-)]
+#[command(arg_required_else_help = true, about = "Helper for git worktrees")]
 struct Cli {
     #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// The worktree name (defaults to the current unix timestamp when omitted)
-    #[arg(value_name = "NAME")]
-    name: Option<String>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List managed worktrees under .worktrees
+    #[command(about = "Create a new worktree")]
+    Create(CreateArgs),
+    #[command(subcommand, about = "Run codex inside a worktree")]
+    Codex(ToolCommand),
+    #[command(subcommand, about = "Run claude inside a worktree")]
+    Claude(ToolCommand),
+    #[command(about = "List existing worktrees")]
     List,
-    /// Remove all managed worktrees
+    #[command(about = "Clear all worktrees for this repo")]
     Clear,
-    /// Create/switch to a worktree and run the configured Codex command
-    Codex {
-        /// Optional worktree name (defaults to timestamp when omitted)
-        #[arg(value_name = "NAME")]
-        name: Option<String>,
-    },
-    /// Create/switch to a worktree and run the configured Claude command
-    Claude {
-        /// Optional worktree name (defaults to timestamp when omitted)
-        #[arg(value_name = "NAME")]
-        name: Option<String>,
-    },
+    #[command(about = "Initialize configuration")]
+    Init,
 }
 
-#[derive(Debug)]
-struct CommandConfig {
+#[derive(Args)]
+struct CreateArgs {
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    #[arg(value_name = "COMMAND", trailing_var_arg = true)]
+    tail: Vec<String>,
+}
+
+#[derive(Subcommand)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+enum ToolCommand {
+    Create(ToolCreateArgs),
+}
+
+#[derive(Args)]
+struct ToolCreateArgs {
+    #[arg(value_name = "NAME")]
+    name: Option<String>,
+    #[arg(value_name = "ARGS", trailing_var_arg = true)]
+    extra: Vec<String>,
+}
+
+struct CommandSpec {
     program: String,
     args: Vec<String>,
 }
 
-struct RepoContext {
-    owner_root: PathBuf,
-}
-
-fn main() {
-    if let Err(err) = run() {
-        eprintln!("{err}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    let repo = match repo_context() {
-        Ok(repo) => repo,
-        Err(err) => {
-            if err.downcast_ref::<NotGitRepo>().is_some() {
-                println!("You need to run this command inside a git repository.");
-                std::process::exit(1);
-            }
-            return Err(err);
-        }
-    };
-
     match cli.command {
-        Some(Commands::List) => list_worktrees(&repo),
-        Some(Commands::Clear) => clear_worktrees(&repo),
-        Some(Commands::Codex { name }) => profile_flow(&repo, &name, "codex"),
-        Some(Commands::Claude { name }) => profile_flow(&repo, &name, "claude"),
-        None => {
-            let worktree_name = cli
-                .name
-                .as_deref()
-                .map(str::to_owned)
-                .unwrap_or_else(default_worktree_name);
-            let path = ensure_worktree(&repo, &worktree_name)?;
-            launch_shell(&path)
+        Commands::Create(args) => {
+            let command = parse_tail(args.tail);
+            create_worktree(args.name, command)?;
         }
-    }
-}
-
-fn profile_flow(repo: &RepoContext, name: &Option<String>, key: &str) -> Result<()> {
-    let worktree_name = name
-        .as_deref()
-        .map(str::to_owned)
-        .unwrap_or_else(default_worktree_name);
-    let path = ensure_worktree(repo, &worktree_name)?;
-    if let Some(config) = load_command_configs()?.get(key) {
-        run_configured_command(&path, config)?;
-    } else {
-        println!(
-            "No command configuration named '{key}' was found in the tool's Cargo.toml package.metadata.worktree."
-        );
-    }
-    launch_shell(&path)
-}
-
-fn ensure_worktree(repo: &RepoContext, name: &str) -> Result<PathBuf> {
-    let worktrees_dir = repo.owner_root.join(".worktrees");
-    if !worktrees_dir.exists() {
-        fs::create_dir_all(&worktrees_dir)
-            .with_context(|| format!("failed to create {}", worktrees_dir.display()))?;
-    }
-
-    let path = worktrees_dir.join(name);
-    if path.exists() {
-        return Ok(path);
-    }
-
-    let branch_exists = branch_exists(repo, name)?;
-    let has_head = has_head(repo)?;
-
-    let mut cmd = Command::new("git");
-    cmd.arg("worktree").arg("add");
-
-    if branch_exists {
-        cmd.arg(&path).arg(name);
-    } else if has_head {
-        cmd.arg("--guess-remote").arg("-b").arg(name).arg(&path);
-    } else {
-        bail!(
-            "Cannot create worktree '{name}' because the repository has no commits yet. Commit once before using worktrees."
-        );
-    }
-
-    let status = cmd
-        .current_dir(&repo.owner_root)
-        .status()
-        .with_context(|| "failed to run git worktree add")?;
-
-    if !status.success() {
-        bail!("git worktree add failed for {name}");
-    }
-
-    println!("Created worktree: {}", path.display());
-    Ok(path)
-}
-
-fn branch_exists(repo: &RepoContext, name: &str) -> Result<bool> {
-    let mut cmd = Command::new("git");
-    cmd.arg("show-ref")
-        .arg("--verify")
-        .arg(format!("refs/heads/{name}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .current_dir(&repo.owner_root);
-
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to check for branch {name}"))?;
-    Ok(status.success())
-}
-
-fn has_head(repo: &RepoContext) -> Result<bool> {
-    let status = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"]) // succeeds only when HEAD exists
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .current_dir(&repo.owner_root)
-        .status()
-        .with_context(|| "failed to determine if HEAD exists")?;
-    Ok(status.success())
-}
-
-fn list_worktrees(repo: &RepoContext) -> Result<()> {
-    let worktrees_dir = repo.owner_root.join(".worktrees");
-    if !worktrees_dir.exists() {
-        println!("No worktrees found under {}", worktrees_dir.display());
-        return Ok(());
-    }
-
-    let mut entries = fs::read_dir(&worktrees_dir)
-        .with_context(|| format!("failed to read {}", worktrees_dir.display()))?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-
-    entries.sort();
-
-    if entries.is_empty() {
-        println!("No worktrees found under {}", worktrees_dir.display());
-    } else {
-        for entry in entries {
-            println!("{}", entry);
-        }
+        Commands::Codex(cmd) => handle_tool("codex", cmd)?,
+        Commands::Claude(cmd) => handle_tool("claude", cmd)?,
+        Commands::List => list()?,
+        Commands::Clear => clear()?,
+        Commands::Init => init_config()?,
     }
     Ok(())
 }
 
-fn clear_worktrees(repo: &RepoContext) -> Result<()> {
-    let worktrees_dir = repo.owner_root.join(".worktrees");
-    let mut removed_any = false;
-
-    prune_worktrees(repo)?;
-
-    if worktrees_dir.exists() {
-        for entry in fs::read_dir(&worktrees_dir)
-            .with_context(|| format!("failed to read {}", worktrees_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            remove_git_worktree(repo, &path)?;
-
-            let was_in_removed = env::current_dir()
-                .ok()
-                .map(|cwd| cwd.starts_with(&path))
-                .unwrap_or(false);
-
-            if path.exists() {
-                if let Err(err) = fs::remove_dir_all(&path) {
-                    if err.kind() != ErrorKind::NotFound {
-                        return Err(err).context(format!("failed to remove {}", path.display()));
-                    }
-                }
-            }
-
-            if was_in_removed {
-                env::set_current_dir(&repo.owner_root)
-                    .context("failed to change directory after removing worktree")?;
-                println!(
-                    "Current worktree directory was removed; switched to {}",
-                    repo.owner_root.display()
-                );
-            }
-
-            removed_any = true;
-        }
-        if removed_any {
-            if let Err(err) = fs::remove_dir(&worktrees_dir) {
-                if err.kind() != ErrorKind::NotFound {
-                    return Err(err)
-                        .context(format!("failed to remove {}", worktrees_dir.display()));
-                }
-            }
+fn handle_tool(name: &str, command: ToolCommand) -> Result<()> {
+    match command {
+        ToolCommand::Create(args) => {
+            let defaults = command_args_for(name);
+            let mut combined = defaults;
+            combined.extend(args.extra.into_iter());
+            let spec = CommandSpec {
+                program: name.to_string(),
+                args: combined,
+            };
+            create_worktree(args.name, Some(spec))
         }
     }
-
-    if !removed_any {
-        println!("No managed worktrees to clear.");
-    }
-
-    Ok(())
 }
 
-fn remove_git_worktree(repo: &RepoContext, path: &Path) -> Result<()> {
-    let target = path
-        .to_str()
-        .ok_or_else(|| anyhow!("worktree path contains invalid UTF-8"))?;
-
-    let output = Command::new("git")
-        .args(["worktree", "remove", "--force", target])
-        .current_dir(&repo.owner_root)
-        .output()
-        .with_context(|| format!("failed to run git worktree remove for {}", path.display()))?;
-
-    if output.status.success() {
-        return Ok(());
+fn parse_tail(mut tail: Vec<String>) -> Option<CommandSpec> {
+    if tail.is_empty() {
+        return None;
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("is not a working tree")
-        || stderr.contains("not a working tree")
-        || stderr.contains("not registered")
-    {
-        return Ok(());
-    }
-
-    if !stderr.trim().is_empty() {
-        println!(
-            "git worktree remove failed for {}: {}",
-            path.display(),
-            stderr.trim()
-        );
-    }
-
-    Ok(())
+    let program = tail.remove(0);
+    Some(CommandSpec {
+        program,
+        args: tail,
+    })
 }
 
-fn prune_worktrees(repo: &RepoContext) -> Result<()> {
-    let output = Command::new("git")
-        .args(["worktree", "prune", "--expire", "now"])
-        .current_dir(&repo.owner_root)
-        .output()
-        .with_context(|| "failed to run git worktree prune")?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!("git worktree prune failed: {}", stderr.trim());
-}
-
-fn shell_interactive_flag(shell: &str) -> Option<&'static str> {
-    match Path::new(shell)
-        .file_name()
-        .and_then(|name| name.to_str())?
-    {
-        "sh" | "bash" | "zsh" | "fish" | "ksh" => Some("-i"),
-        _ => None,
-    }
-}
-
-fn launch_shell(path: &Path) -> Result<()> {
-    let shell = env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
-    println!("Switching to worktree at {}", path.display());
-
-    env::set_current_dir(path)
-        .with_context(|| format!("failed to change directory to {}", path.display()))?;
-
-    let mut command = Command::new(&shell);
-    command.current_dir(path);
-    if let Some(flag) = shell_interactive_flag(&shell) {
-        command.arg(flag);
-    }
-    command
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        let err = command.exec();
-        return Err(anyhow!("failed to launch shell '{shell}': {err}"));
-    }
-
-    #[cfg(not(unix))]
-    {
-        let status = command
+fn create_worktree(name: Option<String>, command: Option<CommandSpec>) -> Result<()> {
+    let (root, _git_dir) = repo_paths()?;
+    let name = name.unwrap_or_else(timestamp);
+    let worktree_root = root.join(".worktrees");
+    fs::create_dir_all(&worktree_root)?;
+    let dest = worktree_root.join(&name);
+    if !dest.exists() {
+        let status = process::Command::new("git")
+            .arg("worktree")
+            .arg("add")
+            .arg("--detach")
+            .arg(&dest)
+            .current_dir(&root)
             .status()
-            .with_context(|| format!("failed to launch shell '{}'", shell))?;
-
+            .context("failed to call git worktree add")?;
         if !status.success() {
-            if let Some(code) = status.code() {
-                println!("Shell exited with status {code}.");
-            }
+            bail!("git worktree add failed");
         }
-        Ok(())
+    } else if !dest.is_dir() {
+        bail!(
+            "worktree path exists and is not a directory: {}",
+            dest.display()
+        );
     }
-}
-
-fn run_configured_command(path: &Path, config: &CommandConfig) -> Result<()> {
-    let mut cmd = Command::new(&config.program);
-    cmd.args(&config.args)
-        .current_dir(path)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run {}", config.program))?;
-
-    if !status.success() {
-        bail!("{} exited with non-zero status", config.program);
+    env::set_current_dir(&dest)?;
+    println!("{}", dest.display());
+    if let Some(command) = command {
+        let status = process::Command::new(&command.program)
+            .current_dir(&dest)
+            .args(command.args)
+            .status()
+            .with_context(|| format!("failed to run {}", command.program))?;
+        if !status.success() {
+            process::exit(status.code().unwrap_or(1));
+        }
+    } else {
+        run_shell(&dest)?;
     }
-
     Ok(())
 }
 
-fn load_command_configs() -> Result<HashMap<String, CommandConfig>> {
-    let value: toml::Value =
-        toml::from_str(MANIFEST).context("failed to parse embedded Cargo.toml")?;
-
-    let mut configs = HashMap::new();
-    if let Some(commands) = value
-        .get("package")
-        .and_then(|pkg| pkg.get("metadata"))
-        .and_then(|meta| meta.get("worktree"))
-        .and_then(|worktree| worktree.get("commands"))
-        .and_then(|cmds| cmds.as_table())
-    {
-        for (name, entry) in commands {
-            if let Some(table) = entry.as_table() {
-                if let Some(program) = table.get("program").and_then(|v| v.as_str()) {
-                    let args = table
-                        .get("args")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(str::to_owned))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    configs.insert(
-                        name.clone(),
-                        CommandConfig {
-                            program: program.to_string(),
-                            args,
-                        },
-                    );
-                }
-            }
-        }
+fn clear() -> Result<()> {
+    let (root, git_dir) = repo_paths()?;
+    env::set_current_dir(&root)?;
+    let worktrees_dir = root.join(".worktrees");
+    if worktrees_dir.exists() {
+        fs::remove_dir_all(&worktrees_dir)?;
     }
-
-    Ok(configs)
+    process::Command::new("git")
+        .arg("worktree")
+        .arg("prune")
+        .current_dir(&root)
+        .status()
+        .ok();
+    remove_if_exists(&git_dir.join("worktrees"))?;
+    remove_if_exists(&git_dir.join("refs/worktree"))?;
+    remove_if_exists(&git_dir.join("logs/refs/worktree"))?;
+    run_shell(&root)?;
+    Ok(())
 }
 
-fn current_dir_resilient() -> Result<PathBuf> {
-    match env::current_dir() {
-        Ok(dir) => Ok(dir),
-        Err(err) => {
-            if err.kind() == ErrorKind::NotFound {
-                if let Ok(pwd) = env::var("PWD") {
-                    let mut candidate = PathBuf::from(pwd);
-                    while !candidate.exists() && candidate.pop() {}
-                    if candidate.exists() {
-                        if let Err(change_err) = env::set_current_dir(&candidate) {
-                            return Err(change_err)
-                                .context("failed to recover working directory after removal");
-                        }
-                        println!(
-                            "Previous worktree directory no longer exists; continuing from {}",
-                            candidate.display()
-                        );
-                        return Ok(candidate);
-                    }
-                }
-                return Err(err).context("failed to determine current directory");
-            }
-            Err(err).context("failed to determine current directory")
+fn list() -> Result<()> {
+    let (root, _git_dir) = repo_paths()?;
+    let worktrees_dir = root.join(".worktrees");
+    if !worktrees_dir.exists() {
+        return Ok(());
+    }
+    let mut entries: Vec<_> = fs::read_dir(&worktrees_dir)?
+        .filter_map(|res| res.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        if let Some(name) = entry.file_name().and_then(|n| n.to_str()) {
+            println!("{}", name);
         }
     }
+    Ok(())
 }
 
-fn repo_context() -> Result<RepoContext> {
-    let mut dir = current_dir_resilient()?;
-
-    loop {
-        match git_output(&dir, &["rev-parse", "--show-toplevel"]) {
-            Ok(worktree_root_str) => {
-                let worktree_root = PathBuf::from(&worktree_root_str);
-                let common_dir_str =
-                    git_output(&worktree_root, &["rev-parse", "--git-common-dir"])?;
-                let mut common_dir = PathBuf::from(&common_dir_str);
-                if !common_dir.is_absolute() {
-                    common_dir = worktree_root.join(&common_dir);
-                }
-                let display_path = common_dir.clone();
-                let common_dir = common_dir.canonicalize().with_context(|| {
-                    format!(
-                        "failed to resolve git common dir {}",
-                        display_path.display()
-                    )
-                })?;
-
-                let owner_root = common_dir
-                    .parent()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "failed to resolve repository root from {}",
-                            common_dir.display()
-                        )
-                    })?
-                    .to_path_buf();
-
-                return Ok(RepoContext { owner_root });
-            }
-            Err(err) => {
-                if err.downcast_ref::<NotGitRepo>().is_some() && dir.pop() {
-                    continue;
-                }
-                return Err(err);
-            }
-        }
+fn init_config() -> Result<()> {
+    let path = config_path()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
-}
-
-fn git_output(dir: &Path, args: &[&str]) -> Result<String> {
-    let mut command = Command::new("git");
-    command.args(args).current_dir(dir);
-
-    let output = command.output().with_context(|| {
-        format!(
-            "failed to execute git {} in {}",
-            args.join(" "),
-            dir.display()
-        )
-    })?;
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if stdout.is_empty() {
-            bail!("git {} returned empty output", args.join(" "));
+    if !path.exists() {
+        fs::write(&path, default_config_contents())?;
+    }
+    let home = home_dir()?;
+    let display = if path.starts_with(&home) {
+        let mut buf = PathBuf::from("~");
+        if let Ok(stripped) = path.strip_prefix(&home) {
+            buf.push(stripped);
         }
-        Ok(stdout)
+        buf
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("not a git repository") {
-            return Err(NotGitRepo.into());
+        path.clone()
+    };
+    println!("initialized config at {}", display.display());
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn run_shell(dest: &Path) -> Result<()> {
+    let shell = env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
+    let status = process::Command::new(shell)
+        .current_dir(dest)
+        .status()
+        .context("failed to run shell")?;
+    if !status.success() {
+        process::exit(status.code().unwrap_or(1));
+    }
+    Ok(())
+}
+
+fn repo_paths() -> Result<(PathBuf, PathBuf)> {
+    let git_dir = PathBuf::from(git_stdout([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ])?);
+    let root = git_dir
+        .parent()
+        .context("failed to determine repository root")?
+        .to_path_buf();
+    Ok((root, git_dir))
+}
+
+fn git_stdout<const N: usize>(args: [&str; N]) -> Result<String> {
+    let output = process::Command::new("git").args(args).output()?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        bail!("git {:?} failed", args);
+    }
+}
+
+fn command_args_for(name: &str) -> Vec<String> {
+    load_config()
+        .and_then(|map| map.get(name).cloned())
+        .unwrap_or_else(|| builtin_command_args(name))
+}
+
+fn load_config() -> Option<HashMap<String, Vec<String>>> {
+    let path = config_path().ok()?;
+    let contents = fs::read_to_string(path).ok()?;
+    parse_config(&contents)
+}
+
+fn parse_config(contents: &str) -> Option<HashMap<String, Vec<String>>> {
+    let value = contents.parse::<Value>().ok()?;
+    let commands = value.get("commands")?.as_table()?;
+    let mut map = HashMap::new();
+    for (name, entry) in commands {
+        if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
+            let list = args
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>();
+            map.insert(name.clone(), list);
         }
-        bail!(
-            "git {} failed in {}: {}",
-            args.join(" "),
-            dir.display(),
-            stderr.trim()
-        );
+    }
+    Some(map)
+}
+
+fn builtin_command_args(name: &str) -> Vec<String> {
+    match name {
+        "codex" => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+        _ => vec![],
     }
 }
 
-fn default_worktree_name() -> String {
-    let timestamp = SystemTime::now()
+fn config_path() -> Result<PathBuf> {
+    let home = home_dir()?;
+    Ok(home.join(".worktree/config.toml"))
+}
+
+fn home_dir() -> Result<PathBuf> {
+    if let Ok(home) = env::var("HOME") {
+        return Ok(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    if let Ok(home) = env::var("USERPROFILE") {
+        return Ok(PathBuf::from(home));
+    }
+    bail!("failed to determine home directory")
+}
+
+fn default_config_contents() -> &'static str {
+    r#"[commands.codex]
+args = ["--dangerously-bypass-approvals-and-sandbox"]
+
+[commands.claude]
+args = []
+"#
+}
+
+fn timestamp() -> String {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_secs();
-    timestamp.to_string()
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
 }
-
-#[derive(Debug)]
-struct NotGitRepo;
-
-impl std::fmt::Display for NotGitRepo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "not a git repository")
-    }
-}
-
-impl std::error::Error for NotGitRepo {}
