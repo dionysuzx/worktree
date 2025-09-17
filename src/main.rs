@@ -19,6 +19,8 @@ struct Cli {
 enum Commands {
     #[command(about = "Create a new worktree")]
     Create(CreateArgs),
+    #[command(about = "Switch to an existing worktree")]
+    Switch(SwitchArgs),
     #[command(subcommand, about = "Run codex inside a worktree")]
     Codex(ToolCommand),
     #[command(subcommand, about = "Run claude inside a worktree")]
@@ -39,16 +41,31 @@ struct CreateArgs {
     tail: Vec<String>,
 }
 
+#[derive(Args)]
+struct SwitchArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
+}
+
 #[derive(Subcommand)]
 #[command(subcommand_required = true, arg_required_else_help = true)]
 enum ToolCommand {
     Create(ToolCreateArgs),
+    Switch(ToolSwitchArgs),
 }
 
 #[derive(Args)]
 struct ToolCreateArgs {
     #[arg(value_name = "NAME")]
     name: Option<String>,
+    #[arg(value_name = "ARGS", trailing_var_arg = true)]
+    extra: Vec<String>,
+}
+
+#[derive(Args)]
+struct ToolSwitchArgs {
+    #[arg(value_name = "NAME")]
+    name: String,
     #[arg(value_name = "ARGS", trailing_var_arg = true)]
     extra: Vec<String>,
 }
@@ -64,6 +81,9 @@ fn main() -> Result<()> {
         Commands::Create(args) => {
             let command = parse_tail(args.tail);
             create_worktree(args.name, command)?;
+        }
+        Commands::Switch(args) => {
+            switch_worktree(args.name, None)?;
         }
         Commands::Codex(cmd) => handle_tool("codex", cmd)?,
         Commands::Claude(cmd) => handle_tool("claude", cmd)?,
@@ -86,6 +106,16 @@ fn handle_tool(name: &str, command: ToolCommand) -> Result<()> {
             };
             create_worktree(args.name, Some(spec))
         }
+        ToolCommand::Switch(args) => {
+            let defaults = command_args_for(name);
+            let mut combined = defaults;
+            combined.extend(args.extra.into_iter());
+            let spec = CommandSpec {
+                program: name.to_string(),
+                args: combined,
+            };
+            switch_worktree(args.name, Some(spec))
+        }
     }
 }
 
@@ -106,29 +136,46 @@ fn create_worktree(name: Option<String>, command: Option<CommandSpec>) -> Result
     let worktree_root = root.join(".worktrees");
     fs::create_dir_all(&worktree_root)?;
     let dest = worktree_root.join(&name);
-    if !dest.exists() {
-        let status = process::Command::new("git")
-            .arg("worktree")
-            .arg("add")
-            .arg("--detach")
-            .arg(&dest)
-            .current_dir(&root)
-            .status()
-            .context("failed to call git worktree add")?;
-        if !status.success() {
-            bail!("git worktree add failed");
+    if dest.exists() {
+        if dest.is_dir() {
+            bail!("worktree '{}' already exists", name);
+        } else {
+            bail!(
+                "worktree path exists and is not a directory: {}",
+                dest.display()
+            );
         }
-    } else if !dest.is_dir() {
-        bail!(
-            "worktree path exists and is not a directory: {}",
-            dest.display()
-        );
     }
-    env::set_current_dir(&dest)?;
+    let status = process::Command::new("git")
+        .arg("worktree")
+        .arg("add")
+        .arg("--detach")
+        .arg(&dest)
+        .current_dir(&root)
+        .status()
+        .context("failed to call git worktree add")?;
+    if !status.success() {
+        bail!("git worktree add failed");
+    }
+    enter_worktree(&dest, command)
+}
+
+fn switch_worktree(name: String, command: Option<CommandSpec>) -> Result<()> {
+    let (root, _git_dir) = repo_paths()?;
+    let dest = root.join(".worktrees").join(&name);
+    if dest.is_dir() {
+        enter_worktree(&dest, command)
+    } else {
+        bail!("worktree '{}' does not exist", name);
+    }
+}
+
+fn enter_worktree(dest: &Path, command: Option<CommandSpec>) -> Result<()> {
+    env::set_current_dir(dest)?;
     println!("{}", dest.display());
     if let Some(command) = command {
         let status = process::Command::new(&command.program)
-            .current_dir(&dest)
+            .current_dir(dest)
             .args(command.args)
             .status()
             .with_context(|| format!("failed to run {}", command.program))?;
@@ -136,7 +183,7 @@ fn create_worktree(name: Option<String>, command: Option<CommandSpec>) -> Result
             process::exit(status.code().unwrap_or(1));
         }
     } else {
-        run_shell(&dest)?;
+        run_shell(dest)?;
     }
     Ok(())
 }

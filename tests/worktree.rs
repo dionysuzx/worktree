@@ -108,6 +108,7 @@ fn help_has_command_descriptions() -> TestResult {
         .arg("--help")
         .assert()
         .stdout(predicate::str::contains("Create a new worktree"))
+        .stdout(predicate::str::contains("Switch to an existing worktree"))
         .stdout(predicate::str::contains("List existing worktrees"))
         .stdout(predicate::str::contains("Initialize configuration"));
     Ok(())
@@ -180,7 +181,36 @@ fn create_named_worktree() -> TestResult {
 }
 
 #[test]
-fn reuse_named_worktree_switches_into_existing() -> TestResult {
+fn create_duplicate_worktree_errors() -> TestResult {
+    let temp = TempDir::new()?;
+    init_repo(temp.path())?;
+    let shell = fake_shell(temp.path())?;
+    Command::cargo_bin("worktree")?
+        .current_dir(temp.path())
+        .arg("create")
+        .arg("feature")
+        .env("HOME", temp.path())
+        .env("SHELL", &shell)
+        .env("WORKTREE_SHELL_LOG", temp.path().join("log1"))
+        .assert()
+        .success();
+    Command::cargo_bin("worktree")?
+        .current_dir(temp.path())
+        .arg("create")
+        .arg("feature")
+        .env("HOME", temp.path())
+        .env("SHELL", &shell)
+        .env("WORKTREE_SHELL_LOG", temp.path().join("log2"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "worktree 'feature' already exists",
+        ));
+    Ok(())
+}
+
+#[test]
+fn switch_named_worktree_enters_existing() -> TestResult {
     let temp = TempDir::new()?;
     init_repo(temp.path())?;
     let shell = fake_shell(temp.path())?;
@@ -195,19 +225,37 @@ fn reuse_named_worktree_switches_into_existing() -> TestResult {
         .assert()
         .success();
     assert!(feature.exists());
-    let log2 = temp.path().join("log2");
+    let log = temp.path().join("switch.log");
     Command::cargo_bin("worktree")?
         .current_dir(temp.path())
-        .arg("create")
+        .arg("switch")
         .arg("feature")
         .env("HOME", temp.path())
         .env("SHELL", &shell)
-        .env("WORKTREE_SHELL_LOG", &log2)
+        .env("WORKTREE_SHELL_LOG", &log)
         .assert()
         .success();
-    let recorded = fs::read_to_string(&log2)?;
+    let recorded = fs::read_to_string(&log)?;
     let cwd = fs::canonicalize(recorded.trim())?;
     assert_eq!(cwd, fs::canonicalize(feature)?);
+    Ok(())
+}
+
+#[test]
+fn switch_missing_worktree_errors() -> TestResult {
+    let temp = TempDir::new()?;
+    init_repo(temp.path())?;
+    let shell = fake_shell(temp.path())?;
+    Command::cargo_bin("worktree")?
+        .current_dir(temp.path())
+        .arg("switch")
+        .arg("dne")
+        .env("HOME", temp.path())
+        .env("SHELL", &shell)
+        .env("WORKTREE_SHELL_LOG", temp.path().join("log"))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("worktree 'dne' does not exist"));
     Ok(())
 }
 
@@ -249,6 +297,59 @@ printf "%s\n" "$PWD" "$@" > "$WORKTREE_TEST_LOG"
     let cwd = fs::canonicalize(Path::new(lines[0]))?;
     let expected = fs::canonicalize(temp.path().join(".worktrees"))?;
     assert!(cwd.starts_with(&expected));
+    assert_eq!(lines[1], "--dangerously-bypass-approvals-and-sandbox");
+    Ok(())
+}
+
+#[test]
+fn codex_switch_runs_with_defaults() -> TestResult {
+    let temp = TempDir::new()?;
+    init_repo(temp.path())?;
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin)?;
+    let log = temp.path().join("run.log");
+    fs::write(
+        bin.join("codex"),
+        r#"#!/bin/sh
+printf "%s\n" "$PWD" "$@" > "$WORKTREE_TEST_LOG"
+"#,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(bin.join("codex"), fs::Permissions::from_mode(0o755))?;
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_else(|_| String::from("/usr/bin"))
+    );
+    let shell = fake_shell(temp.path())?;
+    Command::cargo_bin("worktree")?
+        .current_dir(temp.path())
+        .arg("create")
+        .arg("feature")
+        .env("HOME", temp.path())
+        .env("SHELL", &shell)
+        .env("WORKTREE_SHELL_LOG", temp.path().join("shell.log"))
+        .assert()
+        .success();
+    Command::cargo_bin("worktree")?
+        .current_dir(temp.path())
+        .arg("codex")
+        .arg("switch")
+        .arg("feature")
+        .env("HOME", temp.path())
+        .env("PATH", path)
+        .env("WORKTREE_TEST_LOG", &log)
+        .assert()
+        .success();
+    let content = fs::read_to_string(&log)?;
+    let lines: Vec<_> = content.lines().collect();
+    assert!(lines.len() >= 2);
+    let cwd = fs::canonicalize(Path::new(lines[0]))?;
+    let expected = fs::canonicalize(temp.path().join(".worktrees/feature"))?;
+    assert_eq!(cwd, expected);
     assert_eq!(lines[1], "--dangerously-bypass-approvals-and-sandbox");
     Ok(())
 }

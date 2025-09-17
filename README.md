@@ -5,12 +5,14 @@ Simple CLI helper around `git worktree` that keeps worktrees flat under a single
 ## Features
 
 - `worktree create [name] [command [args…]]` – create a detached worktree, drop into it (or run a command in it) no matter where you are in the repo. When no name is supplied a timestamp is used.
-- `worktree codex create [name] [args…]` – create/switch to a worktree and launch `codex` with baked-in defaults. Same pattern for `claude`.
+- `worktree switch <name>` – jump into an existing worktree (or let a tool command run inside it).
+- `worktree codex create [name] [args…]` – create a worktree and launch `codex` with baked-in defaults. Same pattern for `claude`.
+- `worktree codex switch <name> [args…]` – open an existing worktree and launch `codex` with defaults. Same pattern for `claude`.
 - `worktree list` – show currently registered worktrees for the repo.
 - `worktree clear` – prune every `.worktrees/*` checkout and related git metadata, then return you to the repo root.
 - `worktree init` – scaffold `~/.worktree/config.toml` so you can customize default args per tool.
 
-Everything works from any directory inside a repo, and repeat invocations with the same name simply switch to the existing worktree.
+Everything works from any directory inside a repo. Use `worktree switch <name>` (or the tool variants) to re-enter an existing checkout.
 
 ## Installation
 
@@ -28,9 +30,12 @@ Key subcommands:
 
 | Command | Description |
 | --- | --- |
-| `create [name] [command …]` | Create/switch to a worktree and optionally run a command in it. |
-| `codex create [name] [args…]` | Launch `codex` inside a worktree, respecting defaults/config. |
-| `claude create [name] [args…]` | Launch `claude` inside a worktree. |
+| `create [name] [command …]` | Create a fresh worktree (timestamp name by default) and optionally run a command in it. |
+| `switch <name>` | Enter an existing worktree and start your shell. |
+| `codex create [name] [args…]` | Launch `codex` inside a newly created worktree, respecting defaults/config. |
+| `codex switch <name> [args…]` | Launch `codex` inside an existing worktree. |
+| `claude create [name] [args…]` | Launch `claude` inside a newly created worktree. |
+| `claude switch <name> [args…]` | Launch `claude` inside an existing worktree. |
 | `list` | List existing worktrees for the current repo. |
 | `clear` | Remove all worktrees and git metadata, then enter the repo root. |
 | `init` | Generate `~/.worktree/config.toml` with default tool args. |
@@ -47,7 +52,7 @@ args = ["--dangerously-bypass-approvals-and-sandbox", "--extra" ]
 args = []
 ```
 
-These overrides will be merged with the baked-in defaults every time you call `worktree codex create …` (or the claude variant).
+These overrides will be merged with the baked-in defaults every time you call `worktree codex create …` or `worktree codex switch …` (and the claude variants).
 
 ### Notes
 
