@@ -275,6 +275,7 @@ fn parse_config(contents: &str) -> Option<HashMap<String, Vec<String>>> {
 fn builtin_command_args(name: &str) -> Vec<String> {
     match name {
         "codex" => vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+        "claude" => vec!["--dangerously-skip-permissions".into()],
         _ => vec![],
     }
 }
@@ -300,7 +301,7 @@ fn default_config_contents() -> &'static str {
 args = ["--dangerously-bypass-approvals-and-sandbox"]
 
 [commands.claude]
-args = []
+args = ["--dangerously-skip-permissions"]
 "#
 }
 
