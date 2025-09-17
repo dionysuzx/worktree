@@ -369,5 +369,6 @@ fn init_writes_default_config() -> TestResult {
     let contents = fs::read_to_string(config)?;
     assert!(contents.contains("codex"));
     assert!(contents.contains("--dangerously-bypass-approvals-and-sandbox"));
+    assert!(contents.contains("--dangerously-skip-permissions"));
     Ok(())
 }
