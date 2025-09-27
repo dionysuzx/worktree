@@ -138,26 +138,46 @@ fn list_shows_worktrees() -> TestResult {
 }
 
 #[test]
-fn create_timestamped_worktree() -> TestResult {
+fn create_sequential_worktrees() -> TestResult {
     let temp = TempDir::new()?;
     init_repo(temp.path())?;
     let shell = fake_shell(temp.path())?;
-    let log = temp.path().join("shell.log");
+    let log1 = temp.path().join("shell1.log");
     Command::cargo_bin("worktree")?
         .current_dir(temp.path())
         .arg("create")
         .env("HOME", temp.path())
         .env("SHELL", &shell)
-        .env("WORKTREE_SHELL_LOG", &log)
+        .env("WORKTREE_SHELL_LOG", &log1)
         .assert()
         .success();
     let dirs = worktrees(temp.path())?;
     assert_eq!(dirs.len(), 1);
-    let name = dirs[0].file_name().unwrap().to_string_lossy();
-    assert!(name.parse::<u64>().is_ok());
-    let recorded = fs::read_to_string(&log)?;
+    let first_name = dirs[0].file_name().unwrap().to_string_lossy();
+    assert_eq!(first_name, "0-wt");
+    let recorded = fs::read_to_string(&log1)?;
     let cwd = fs::canonicalize(recorded.trim())?;
     assert_eq!(cwd, fs::canonicalize(&dirs[0])?);
+
+    let log2 = temp.path().join("shell2.log");
+    Command::cargo_bin("worktree")?
+        .current_dir(temp.path())
+        .arg("create")
+        .env("HOME", temp.path())
+        .env("SHELL", &shell)
+        .env("WORKTREE_SHELL_LOG", &log2)
+        .assert()
+        .success();
+    let dirs = worktrees(temp.path())?;
+    assert_eq!(dirs.len(), 2);
+    let names: Vec<_> = dirs
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(names, ["0-wt", "1-wt"]);
+    let recorded = fs::read_to_string(&log2)?;
+    let cwd = fs::canonicalize(recorded.trim())?;
+    assert_eq!(cwd, fs::canonicalize(&dirs[1])?);
     Ok(())
 }
 

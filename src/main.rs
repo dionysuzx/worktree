@@ -5,7 +5,6 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
 use toml::Value;
 
 #[derive(Parser)]
@@ -132,9 +131,12 @@ fn parse_tail(mut tail: Vec<String>) -> Option<CommandSpec> {
 
 fn create_worktree(name: Option<String>, command: Option<CommandSpec>) -> Result<()> {
     let (root, _git_dir) = repo_paths()?;
-    let name = name.unwrap_or_else(timestamp);
     let worktree_root = root.join(".worktrees");
     fs::create_dir_all(&worktree_root)?;
+    let name = match name {
+        Some(name) => name,
+        None => next_worktree_name(&worktree_root)?,
+    };
     let dest = worktree_root.join(&name);
     if dest.exists() {
         if dest.is_dir() {
@@ -352,10 +354,30 @@ args = ["--dangerously-skip-permissions"]
 "#
 }
 
-fn timestamp() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string()
+fn next_worktree_name(worktree_root: &Path) -> Result<String> {
+    let mut highest = None;
+    if worktree_root.exists() {
+        for entry in fs::read_dir(worktree_root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(index) = worktree_index(name) {
+                    highest = Some(match highest {
+                        Some(current) if current > index => current,
+                        _ => index,
+                    });
+                }
+            }
+        }
+    }
+    let next = highest.map_or(0, |value| value + 1);
+    Ok(format!("{}-wt", next))
+}
+
+fn worktree_index(name: &str) -> Option<usize> {
+    name.strip_suffix("-wt")
+        .or_else(|| name.strip_suffix("-worktree"))
+        .and_then(|prefix| prefix.parse::<usize>().ok())
 }
