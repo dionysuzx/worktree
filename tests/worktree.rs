@@ -497,15 +497,15 @@ fn create_from_subdir_uses_repo_root() -> TestResult {
 }
 
 #[test]
-fn non_repo_errors_cleanly() -> TestResult {
+fn non_repo_is_silent_noop() -> TestResult {
     let temp = TempDir::new()?;
     let output = Command::cargo_bin("worktree")?
         .current_dir(temp.path())
         .args(["list"])
         .output()?;
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
-    assert!(stderr.contains("not a git repository") || stderr.contains("git"));
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
     Ok(())
 }
 

@@ -33,15 +33,11 @@ impl CommandSpec {
 }
 
 impl Repo {
-    pub(crate) fn discover() -> Result<Self> {
-        let git_common_dir =
-            git::stdout(["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    pub(crate) fn try_discover() -> Option<Self> {
+        let git_common_dir = git::stdout(["rev-parse", "--path-format=absolute", "--git-common-dir"]).ok()?;
         let git_common_dir = PathBuf::from(git_common_dir);
-        let root = git_common_dir
-            .parent()
-            .context("failed to determine repository root")?
-            .to_path_buf();
-        Ok(Self {
+        let root = git_common_dir.parent()?.to_path_buf();
+        Some(Self {
             worktrees_dir: root.join(".worktrees"),
             root,
             git_common_dir,
